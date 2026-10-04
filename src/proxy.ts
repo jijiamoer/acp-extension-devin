@@ -93,6 +93,12 @@ interface PendingRequest {
   manualCompaction?: boolean;
   /** hides the coalesced runtime response of a forwarded steer prompt. */
   suppressPromptResponse?: boolean;
+  /**
+   * steerId tied to this prompt: set on adapter-forwarded steers (applied
+   * already sent; errors surface as a notice) and on meta-tagged prompts that
+   * actually steered a running turn (applied sent with the response).
+   */
+  steerId?: string;
 }
 
 interface ActiveCompaction {
@@ -222,6 +228,12 @@ export class DevinAcpProxy {
         method: msg.method,
         sessionId,
         manualCompaction,
+        // A tagged prompt is a steer only while another client turn runs;
+        // on its own it is just a prompt and earns no steer_applied.
+        steerId:
+          steer && sessionId && this.hasActiveClientPrompt(sessionId)
+            ? steer.steerId
+            : undefined,
       });
 
       if (msg.method === "initialize") {
@@ -264,21 +276,6 @@ export class DevinAcpProxy {
       ) {
         this.replaying.add(sessionId);
         this.manualCompactionArmed.delete(sessionId);
-      }
-
-      // Meta-tagged steers report application like the request transport: a
-      // successful write is Devin's steer delivery.
-      if (steer && sessionId) {
-        return {
-          toClient: [
-            {
-              jsonrpc: "2.0",
-              method: STEER_APPLIED_METHOD,
-              params: { sessionId, steerId: steer.steerId },
-            },
-          ],
-          toRuntime: [msg],
-        };
       }
     }
     // Client responses to runtime reverse requests carry an id but no method;
@@ -387,7 +384,22 @@ export class DevinAcpProxy {
         }
       }
       if (pending.suppressPromptResponse) {
+        if (pending.steerId && msg.error !== undefined) {
+          toClient.push(
+            this.steerFailureNotice(pending.sessionId, pending.steerId, msg),
+          );
+        }
         return { toClient, toRuntime: [] };
+      }
+      // Meta-tagged steers report application with their own response: it
+      // cannot arrive before the sender's completion, and a rejected prompt
+      // must never be reported applied.
+      if (pending.steerId && msg.error === undefined) {
+        toClient.push({
+          jsonrpc: "2.0",
+          method: STEER_APPLIED_METHOD,
+          params: { sessionId: pending.sessionId, steerId: pending.steerId },
+        });
       }
     }
 
@@ -396,13 +408,14 @@ export class DevinAcpProxy {
   }
 
   /**
-   * `_lody/session/steer`: answer the client immediately, then inject the
-   * prompt mid-turn as an adapter-owned session/prompt — Devin's native steer
-   * transport, so a successful write is the provider application. steer_applied
-   * is emitted at once: the forwarded prompt's coalesced response arrives only
-   * at turn end, after the turn's own response, which would race the client's
-   * completion (verified live: Lody drops late applications). That coalesced
-   * response is therefore suppressed entirely.
+   * `_lody/session/steer`: only while the session has a client-owned prompt
+   * in flight — an idle session would otherwise turn the forwarded write into
+   * an invisible new turn whose response nobody owns. Accepted steers answer
+   * `injected` and emit steer_applied at once: the forwarded prompt's coalesced
+   * response arrives only at turn end, after the turn's own response, which
+   * would race the client's completion (verified live: Lody drops late
+   * applications). A rejected forward surfaces as a session notice so the
+   * application claim never stands alone.
    */
   private handleSteerRequest(msg: JsonRpcRequest): ProxyOutput {
     const fail = (): ProxyOutput => ({
@@ -420,7 +433,8 @@ export class DevinAcpProxy {
       sessionId === undefined ||
       steerId === undefined ||
       !Array.isArray(prompt) ||
-      !this.admitted.has(sessionId)
+      !this.admitted.has(sessionId) ||
+      !this.hasActiveClientPrompt(sessionId)
     ) {
       return fail();
     }
@@ -430,6 +444,7 @@ export class DevinAcpProxy {
       method: "session/prompt",
       sessionId,
       suppressPromptResponse: true,
+      steerId,
     });
     return {
       toClient: [
@@ -448,6 +463,56 @@ export class DevinAcpProxy {
           params: { sessionId, prompt },
         },
       ],
+    };
+  }
+
+  /**
+   * A client-owned `session/prompt` is in flight for this session — the only
+   * state in which a steer can ride a live turn. Adapter-forwarded prompts
+   * (suppressed responses) do not count.
+   */
+  private hasActiveClientPrompt(sessionId: string): boolean {
+    for (const p of this.pending.values()) {
+      if (
+        p.method === "session/prompt" &&
+        p.sessionId === sessionId &&
+        !p.suppressPromptResponse
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** `_meta.lody.notice` surfacing a forwarded steer Devin rejected. */
+  private steerFailureNotice(
+    sessionId: string,
+    steerId: string,
+    msg: JsonRpcResponse,
+  ): JsonRpcMessage {
+    const detail = isRecord(msg.error)
+      ? typeof msg.error["message"] === "string"
+        ? msg.error["message"]
+        : `error ${msg.error["code"]}`
+      : "unknown error";
+    return {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: {
+            lody: {
+              notice: {
+                level: "error",
+                message: `Steer ${steerId} failed: ${detail}`,
+                source: "devin",
+              },
+            },
+          },
+        },
+      },
     };
   }
 
