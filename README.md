@@ -55,6 +55,7 @@ after bilateral negotiation. Other ACP traffic passes through.
   runtime reports it.
 - Core `subagentEvents` v1, described below.
 - Core `compaction` v1, described below.
+- Core `steering` v1, described below.
 - MCP servers supplied by the client, forwarded verbatim.
 
 Usage accounting and a dedicated Plan Mode translation are not
@@ -117,6 +118,40 @@ Through the adapter on Devin 3000.11.3:
 
 In Lody Nightly 0.103.0-nightly.1, with Devin's global configuration isolated,
 a session created from the UI called a tool on Lody's built-in HTTP MCP server.
+
+## Steering
+
+`devin acp` steers natively: a `session/prompt` sent while a turn is running
+interrupts the current instruction and injects the message into the same turn.
+Both the interrupted and the steering request resolve when that turn ends, and
+Devin coalesces their responses onto the first user message.
+
+The adapter advertises `steering` v1 (`transport: "request"`,
+`upstreamTurn: "same"`, `configPolicy: "active"`) and serves it two ways:
+
+- `_lody/session/steer` is accepted only while a client-owned prompt is in
+  flight for the session — on an idle session the forwarded write would
+  start an invisible turn nobody owns, so it answers
+  `{outcome: "failed"}` instead. Accepted steers return `injected` plus
+  `steer_applied` at once: Devin's write is the application, and the
+  forwarded prompt's coalesced response (which arrives only at turn end,
+  after the turn's own response) is suppressed entirely. If Devin rejects
+  the forward, the error surfaces as a `session_info_update` carrying
+  `_meta.lody.notice` at level `error` — the one place a post-application
+  failure signal can go.
+- `_meta.lody.steer: { id }` on a client `session/prompt` is stripped before
+  forwarding; when another client turn is running the prompt counts as a
+  steer and `steer_applied` precedes its (success) response, while a
+  rejected prompt reports only its own error. With no turn in flight the
+  tag is ignored — a lone prompt is a prompt, not a steer.
+
+Steers to unknown or unadmitted sessions also fail with
+`outcome: "failed"`. Verified on Devin 3000.11.3 and 3000.10.31: the
+steering message overrides the in-flight instruction inside the same turn,
+and backgrounded tool calls keep running. Reporting `steer_applied` earlier
+than the coalesced response is required on the request transport — Devin
+answers the turn's original request first, and a client racing its turn
+completion would otherwise drop the application.
 
 ## Validation
 

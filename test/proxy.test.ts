@@ -45,6 +45,12 @@ describe("DevinAcpProxy", () => {
                   subagentEvents: { version: 1 },
                   compaction: { version: 1 },
                   elicitation: { version: 1 },
+                  steering: {
+                    version: 1,
+                    transport: "request",
+                    upstreamTurn: "same",
+                    configPolicy: "active",
+                  },
                 },
               },
             },
@@ -361,6 +367,12 @@ describe("compaction lifecycle translation", () => {
                   subagentEvents: { version: 1 },
                   compaction: { version: 1 },
                   elicitation: { version: 1 },
+                  steering: {
+                    version: 1,
+                    transport: "request",
+                    upstreamTurn: "same",
+                    configPolicy: "active",
+                  },
                 },
               },
             },
@@ -899,6 +911,318 @@ describe("compaction lifecycle translation", () => {
     };
     expect(proxy.handleRuntime(plain)).toEqual({
       toClient: [plain],
+      toRuntime: [],
+    });
+  });
+});
+
+describe("steer translation", () => {
+  let nextId = 0;
+  const newProxy = () => new DevinAcpProxy({ newId: () => `fwd-${++nextId}` });
+  const init = (proxy: DevinAcpProxy) => {
+    proxy.handleClient(initializeRequest);
+    proxy.handleRuntime(initializeResponse);
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "session/new",
+      params: { cwd: "/w", mcpServers: [] },
+    });
+    proxy.handleRuntime({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { sessionId: "s1", configOptions: [] },
+    });
+  };
+  const startTurn = (proxy: DevinAcpProxy, sessionId = "s1", id = 5) => {
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id,
+      method: "session/prompt",
+      params: { sessionId, prompt: [{ type: "text", text: "slow" }] },
+    });
+    return id;
+  };
+
+  it("answers injected + applied at once, forwards an adapter-owned prompt, and suppresses its response", () => {
+    const proxy = newProxy();
+    init(proxy);
+    startTurn(proxy);
+
+    // Applied is emitted with the steer answer: the forwarded prompt is
+    // Devin's steer transport, so a successful write is the application. Its
+    // coalesced response only arrives at turn end — after the turn's own
+    // response — which would race the client's turn completion.
+    const out = proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "_lody/session/steer",
+      params: {
+        sessionId: "s1",
+        steerId: "st-1",
+        prompt: [{ type: "text", text: "now do X" }],
+      },
+    });
+    expect(out).toEqual({
+      toClient: [
+        { jsonrpc: "2.0", id: 9, result: { outcome: "injected" } },
+        {
+          jsonrpc: "2.0",
+          method: "_lody/session/steer_applied",
+          params: { sessionId: "s1", steerId: "st-1" },
+        },
+      ],
+      toRuntime: [
+        {
+          jsonrpc: "2.0",
+          id: "fwd-1",
+          method: "session/prompt",
+          params: {
+            sessionId: "s1",
+            prompt: [{ type: "text", text: "now do X" }],
+          },
+        },
+      ],
+    });
+
+    // Devin coalesces the steered turn's response onto the first user message;
+    // the client never sees it.
+    expect(
+      proxy.handleRuntime({
+        jsonrpc: "2.0",
+        id: "fwd-1",
+        result: { stopReason: "end_turn" },
+      }),
+    ).toEqual({ toClient: [], toRuntime: [] });
+  });
+
+  it("lets the turn's own prompt response pass through untouched", () => {
+    const proxy = newProxy();
+    init(proxy);
+
+    startTurn(proxy);
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "_lody/session/steer",
+      params: {
+        sessionId: "s1",
+        steerId: "st-1",
+        prompt: [{ type: "text", text: "now do X" }],
+      },
+    });
+    const originalResponse = {
+      jsonrpc: "2.0",
+      id: 5,
+      result: { stopReason: "end_turn" },
+    };
+    expect(proxy.handleRuntime(originalResponse)).toEqual({
+      toClient: [originalResponse],
+      toRuntime: [],
+    });
+  });
+
+  it("fails steers for unknown sessions, malformed requests, and idle sessions", () => {
+    const proxy = newProxy();
+    init(proxy);
+
+    for (const params of [
+      { sessionId: "ghost", steerId: "st", prompt: [] },
+      { sessionId: "s1", prompt: [] }, // no steerId
+      { sessionId: "s1", steerId: "st" }, // no prompt
+      // s1 is admitted but no client turn is in flight — forwarding would
+      // start an invisible turn nobody owns.
+      { sessionId: "s1", steerId: "st", prompt: [{ type: "text", text: "x" }] },
+    ]) {
+      expect(
+        proxy.handleClient({
+          jsonrpc: "2.0",
+          id: 9,
+          method: "_lody/session/steer",
+          params,
+        }),
+      ).toEqual({
+        toClient: [{ jsonrpc: "2.0", id: 9, result: { outcome: "failed" } }],
+        toRuntime: [],
+      });
+    }
+
+    // Positive control: with a client turn in flight the same steer injects.
+    startTurn(proxy);
+    expect(
+      proxy.handleClient({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "_lody/session/steer",
+        params: {
+          sessionId: "s1",
+          steerId: "st-2",
+          prompt: [{ type: "text", text: "x" }],
+        },
+      }).toClient[0],
+    ).toMatchObject({ result: { outcome: "injected" } });
+  });
+
+  it("surfaces a session notice when the forwarded steer errors", () => {
+    const proxy = newProxy();
+    init(proxy);
+    startTurn(proxy);
+    const out = proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "_lody/session/steer",
+      params: {
+        sessionId: "s1",
+        steerId: "st-1",
+        prompt: [{ type: "text", text: "x" }],
+      },
+    });
+    const fwdId = (out.toRuntime[0] as { id: string }).id;
+    // The steer was already reported injected + applied; a rejected forward
+    // preserves the failure signal via _meta.lody.notice.
+    expect(
+      proxy.handleRuntime({
+        jsonrpc: "2.0",
+        id: fwdId,
+        error: { code: -32603, message: "boom" },
+      }),
+    ).toEqual({
+      toClient: [
+        {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "s1",
+            update: {
+              sessionUpdate: "session_info_update",
+              _meta: {
+                lody: {
+                  notice: {
+                    level: "error",
+                    message: "Steer st-1 failed: boom",
+                    source: "devin",
+                  },
+                },
+              },
+            },
+          },
+        },
+      ],
+      toRuntime: [],
+    });
+  });
+
+  it("supports _meta.lody.steer on session/prompt, strips it, and reports applied with the response", () => {
+    const proxy = newProxy();
+    init(proxy);
+    startTurn(proxy, "s1", 4); // a real steer needs a running client turn
+
+    const request = {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "session/prompt",
+      params: {
+        sessionId: "s1",
+        prompt: [{ type: "text", text: "steer me" }],
+        _meta: {
+          lody: { steer: { id: "st-9" }, other: { keep: 1 } },
+          "cognition.ai/trace": 7,
+        },
+      },
+    };
+    expect(proxy.handleClient(request)).toEqual({
+      toClient: [],
+      toRuntime: [
+        {
+          ...request,
+          params: {
+            sessionId: "s1",
+            prompt: [{ type: "text", text: "steer me" }],
+            _meta: { lody: { other: { keep: 1 } }, "cognition.ai/trace": 7 },
+          },
+        },
+      ],
+    });
+
+    const response = {
+      jsonrpc: "2.0",
+      id: 5,
+      result: { stopReason: "end_turn" },
+    };
+    expect(proxy.handleRuntime(response)).toEqual({
+      toClient: [
+        {
+          jsonrpc: "2.0",
+          method: "_lody/session/steer_applied",
+          params: { sessionId: "s1", steerId: "st-9" },
+        },
+        response,
+      ],
+      toRuntime: [],
+    });
+  });
+
+  it("drops an empty _meta.lody wrapper and reports no applied on error", () => {
+    const proxy = newProxy();
+    init(proxy);
+    startTurn(proxy, "s1", 4);
+
+    const request = {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "session/prompt",
+      params: {
+        sessionId: "s1",
+        prompt: [],
+        _meta: { lody: { steer: { id: "st-e" } } },
+      },
+    };
+    const out = proxy.handleClient(request);
+    expect(out).toEqual({
+      toClient: [],
+      toRuntime: [
+        {
+          ...request,
+          params: { sessionId: "s1", prompt: [] },
+        },
+      ],
+    });
+
+    // A rejected prompt never reports applied; its own error reaches the client.
+    const errorResponse = {
+      jsonrpc: "2.0",
+      id: 5,
+      error: { code: -32603, message: "boom" },
+    };
+    expect(proxy.handleRuntime(errorResponse)).toEqual({
+      toClient: [errorResponse],
+      toRuntime: [],
+    });
+  });
+
+  it("treats a meta-tagged prompt on an idle session as a plain prompt", () => {
+    const proxy = newProxy();
+    init(proxy);
+
+    // Nothing steered without a running turn: meta is still stripped, but no
+    // steer_applied is emitted even when the prompt succeeds.
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "session/prompt",
+      params: {
+        sessionId: "s1",
+        prompt: [{ type: "text", text: "hi" }],
+        _meta: { lody: { steer: { id: "st-idle" } } },
+      },
+    });
+    const response = {
+      jsonrpc: "2.0",
+      id: 5,
+      result: { stopReason: "end_turn" },
+    };
+    expect(proxy.handleRuntime(response)).toEqual({
+      toClient: [response],
       toRuntime: [],
     });
   });

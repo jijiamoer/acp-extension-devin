@@ -171,6 +171,12 @@ describe("negotiation", () => {
       subagentEvents: { version: 1 },
       compaction: { version: 1 },
       elicitation: { version: 1 },
+      steering: {
+        version: 1,
+        transport: "request",
+        upstreamTurn: "same",
+        configPolicy: "active",
+      },
     });
 
     newSession(proxy);
