@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  LODY_EXTENSION_METHODS,
   LODY_SUBAGENT_EVENT_METHOD,
   supportsLodySubagentEvents,
 } from "acp-extension-core";
@@ -24,6 +25,16 @@ const COMPACTION_CAPABILITY = { version: 1 } as const;
 const ELICITATION_CAPABILITY = { version: 1 } as const;
 const COMPACTION_ACTIVITY_META = {
   lody: { activity: { version: 1, kind: "context_compaction" } },
+} as const;
+const STEER_METHOD = LODY_EXTENSION_METHODS.sessionSteer;
+const STEER_APPLIED_METHOD = LODY_EXTENSION_METHODS.sessionSteerApplied;
+// `devin acp` injects a mid-turn session/prompt into the active turn, so the
+// adapter serves the dedicated steer request and reports same-turn injection.
+const STEER_CAPABILITY = {
+  version: 1,
+  transport: "request",
+  upstreamTurn: "same",
+  configPolicy: "active",
 } as const;
 
 export type JsonRpcId = string | number;
@@ -80,6 +91,10 @@ interface PendingRequest {
   method: string;
   sessionId?: string;
   manualCompaction?: boolean;
+  /** steerId to echo on `_lody/session/steer_applied` when the prompt resolves. */
+  steerId?: string;
+  /** 'suppress' hides the coalesced runtime response (dedicated steer request). */
+  steerResponse?: "suppress" | "forward";
 }
 
 interface ActiveCompaction {
@@ -109,6 +124,36 @@ function isManualCompactionPrompt(params: unknown): boolean {
   }
   const command = contract.compactionManualCommand;
   return text === command || text?.startsWith(`${command} `) === true;
+}
+
+/**
+ * Reads `params._meta.lody.steer` off a session/prompt and returns the prompt
+ * params with that field stripped. Returns undefined when absent or malformed.
+ */
+function takeLodySteer(
+  params: unknown,
+): { steerId: string; params: Record<string, unknown> } | undefined {
+  if (!isRecord(params)) return undefined;
+  const meta = isRecord(params["_meta"]) ? params["_meta"] : undefined;
+  const lody = isRecord(meta?.["lody"]) ? meta["lody"] : undefined;
+  const steer = isRecord(lody?.["steer"]) ? lody["steer"] : undefined;
+  if (typeof steer?.["id"] !== "string") return undefined;
+
+  const restLody = { ...lody };
+  delete restLody["steer"];
+  const restMeta = { ...meta };
+  if (Object.keys(restLody).length > 0) {
+    restMeta["lody"] = restLody;
+  } else {
+    delete restMeta["lody"];
+  }
+  const next = { ...params };
+  if (Object.keys(restMeta).length > 0) {
+    next["_meta"] = restMeta;
+  } else {
+    delete next["_meta"];
+  }
+  return { steerId: steer["id"], params: next };
 }
 
 /**
@@ -150,6 +195,23 @@ export class DevinAcpProxy {
     if (!isRecord(msg)) return { toClient: [], toRuntime: [msg] };
 
     if (isRequest(msg)) {
+      if (msg.method === STEER_METHOD) {
+        return this.handleSteerRequest(msg);
+      }
+
+      // `_meta.lody.steer` tags a prompt as a steer: strip it before the
+      // runtime sees it and mark the pending request for steer_applied.
+      const steer =
+        msg.method === "session/prompt" ? takeLodySteer(msg.params) : undefined;
+      if (steer) {
+        msg = {
+          jsonrpc: "2.0",
+          id: msg.id,
+          method: msg.method,
+          params: steer.params,
+        };
+      }
+
       const sessionId =
         isRecord(msg.params) && typeof msg.params["sessionId"] === "string"
           ? msg.params["sessionId"]
@@ -162,6 +224,8 @@ export class DevinAcpProxy {
         method: msg.method,
         sessionId,
         manualCompaction,
+        steerId: steer?.steerId,
+        steerResponse: steer ? "forward" : undefined,
       });
 
       if (msg.method === "initialize") {
@@ -266,6 +330,7 @@ export class DevinAcpProxy {
               subagentEvents: SUBAGENT_EVENTS_CAPABILITY,
               compaction: COMPACTION_CAPABILITY,
               elicitation: ELICITATION_CAPABILITY,
+              steering: STEER_CAPABILITY,
             },
           },
         },
@@ -310,10 +375,69 @@ export class DevinAcpProxy {
           toClient.push(...this.render(session, o));
         }
       }
+      if (pending.steerId && msg.error === undefined) {
+        toClient.push({
+          jsonrpc: "2.0",
+          method: STEER_APPLIED_METHOD,
+          params: { sessionId: pending.sessionId, steerId: pending.steerId },
+        });
+      }
+      if (pending.steerResponse === "suppress") {
+        return { toClient, toRuntime: [] };
+      }
     }
 
     toClient.push(msg);
     return { toClient, toRuntime: [] };
+  }
+
+  /**
+   * `_lody/session/steer`: answer the client immediately, then inject the
+   * prompt mid-turn as an adapter-owned session/prompt. Devin coalesces the
+   * steered prompt's response onto the turn's first user message, so that
+   * response never reaches the client — it only fires steer_applied.
+   */
+  private handleSteerRequest(msg: JsonRpcRequest): ProxyOutput {
+    const fail = (): ProxyOutput => ({
+      toClient: [{ jsonrpc: "2.0", id: msg.id, result: { outcome: "failed" } }],
+      toRuntime: [],
+    });
+
+    const params = isRecord(msg.params) ? msg.params : {};
+    const sessionId =
+      typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
+    const steerId =
+      typeof params["steerId"] === "string" ? params["steerId"] : undefined;
+    const prompt = params["prompt"];
+    if (
+      sessionId === undefined ||
+      steerId === undefined ||
+      !Array.isArray(prompt) ||
+      !this.admitted.has(sessionId)
+    ) {
+      return fail();
+    }
+
+    const fwdId = this.newId();
+    this.pending.set(fwdId, {
+      method: "session/prompt",
+      sessionId,
+      steerId,
+      steerResponse: "suppress",
+    });
+    return {
+      toClient: [
+        { jsonrpc: "2.0", id: msg.id, result: { outcome: "injected" } },
+      ],
+      toRuntime: [
+        {
+          jsonrpc: "2.0",
+          id: fwdId,
+          method: "session/prompt",
+          params: { sessionId, prompt },
+        },
+      ],
+    };
   }
 
   private handleRuntimeRequest(msg: JsonRpcRequest): ProxyOutput {

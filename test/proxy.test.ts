@@ -45,6 +45,12 @@ describe("DevinAcpProxy", () => {
                   subagentEvents: { version: 1 },
                   compaction: { version: 1 },
                   elicitation: { version: 1 },
+                  steering: {
+                    version: 1,
+                    transport: "request",
+                    upstreamTurn: "same",
+                    configPolicy: "active",
+                  },
                 },
               },
             },
@@ -361,6 +367,12 @@ describe("compaction lifecycle translation", () => {
                   subagentEvents: { version: 1 },
                   compaction: { version: 1 },
                   elicitation: { version: 1 },
+                  steering: {
+                    version: 1,
+                    transport: "request",
+                    upstreamTurn: "same",
+                    configPolicy: "active",
+                  },
                 },
               },
             },
@@ -899,6 +911,203 @@ describe("compaction lifecycle translation", () => {
     };
     expect(proxy.handleRuntime(plain)).toEqual({
       toClient: [plain],
+      toRuntime: [],
+    });
+  });
+});
+
+describe("steer translation", () => {
+  let nextId = 0;
+  const newProxy = () => new DevinAcpProxy({ newId: () => `fwd-${++nextId}` });
+  const init = (proxy: DevinAcpProxy) => {
+    proxy.handleClient(initializeRequest);
+    proxy.handleRuntime(initializeResponse);
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "session/new",
+      params: { cwd: "/w", mcpServers: [] },
+    });
+    proxy.handleRuntime({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { sessionId: "s1", configOptions: [] },
+    });
+  };
+
+  it("answers injected, forwards an adapter-owned prompt, and reports steer_applied on resolve", () => {
+    const proxy = newProxy();
+    init(proxy);
+
+    const out = proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "_lody/session/steer",
+      params: {
+        sessionId: "s1",
+        steerId: "st-1",
+        prompt: [{ type: "text", text: "now do X" }],
+      },
+    });
+    expect(out).toEqual({
+      toClient: [{ jsonrpc: "2.0", id: 9, result: { outcome: "injected" } }],
+      toRuntime: [
+        {
+          jsonrpc: "2.0",
+          id: "fwd-1",
+          method: "session/prompt",
+          params: {
+            sessionId: "s1",
+            prompt: [{ type: "text", text: "now do X" }],
+          },
+        },
+      ],
+    });
+
+    // Devin coalesces the steered turn's response onto the first user message;
+    // the client never sees it — it only fires steer_applied.
+    expect(
+      proxy.handleRuntime({
+        jsonrpc: "2.0",
+        id: "fwd-1",
+        result: { stopReason: "end_turn" },
+      }),
+    ).toEqual({
+      toClient: [
+        {
+          jsonrpc: "2.0",
+          method: "_lody/session/steer_applied",
+          params: { sessionId: "s1", steerId: "st-1" },
+        },
+      ],
+      toRuntime: [],
+    });
+  });
+
+  it("fails steers for unknown sessions and malformed requests", () => {
+    const proxy = newProxy();
+    init(proxy);
+
+    for (const params of [
+      { sessionId: "ghost", steerId: "st", prompt: [] },
+      { sessionId: "s1", prompt: [] }, // no steerId
+      { sessionId: "s1", steerId: "st" }, // no prompt
+    ]) {
+      expect(
+        proxy.handleClient({
+          jsonrpc: "2.0",
+          id: 9,
+          method: "_lody/session/steer",
+          params,
+        }),
+      ).toEqual({
+        toClient: [{ jsonrpc: "2.0", id: 9, result: { outcome: "failed" } }],
+        toRuntime: [],
+      });
+    }
+  });
+
+  it("emits nothing client-side when the forwarded steer errors", () => {
+    const proxy = newProxy();
+    init(proxy);
+    const out = proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "_lody/session/steer",
+      params: {
+        sessionId: "s1",
+        steerId: "st-1",
+        prompt: [{ type: "text", text: "x" }],
+      },
+    });
+    const fwdId = (out.toRuntime[0] as { id: string }).id;
+    expect(
+      proxy.handleRuntime({
+        jsonrpc: "2.0",
+        id: fwdId,
+        error: { code: -32603, message: "boom" },
+      }),
+    ).toEqual({ toClient: [], toRuntime: [] });
+  });
+
+  it("supports _meta.lody.steer on session/prompt, strips it, and still forwards the response", () => {
+    const proxy = newProxy();
+    init(proxy);
+
+    const request = {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "session/prompt",
+      params: {
+        sessionId: "s1",
+        prompt: [{ type: "text", text: "steer me" }],
+        _meta: {
+          lody: { steer: { id: "st-9" }, other: { keep: 1 } },
+          "cognition.ai/trace": 7,
+        },
+      },
+    };
+    expect(proxy.handleClient(request)).toEqual({
+      toClient: [],
+      toRuntime: [
+        {
+          ...request,
+          params: {
+            sessionId: "s1",
+            prompt: [{ type: "text", text: "steer me" }],
+            _meta: { lody: { other: { keep: 1 } }, "cognition.ai/trace": 7 },
+          },
+        },
+      ],
+    });
+
+    const response = {
+      jsonrpc: "2.0",
+      id: 5,
+      result: { stopReason: "end_turn" },
+    };
+    expect(proxy.handleRuntime(response)).toEqual({
+      toClient: [
+        {
+          jsonrpc: "2.0",
+          method: "_lody/session/steer_applied",
+          params: { sessionId: "s1", steerId: "st-9" },
+        },
+        response,
+      ],
+      toRuntime: [],
+    });
+  });
+
+  it("drops an empty _meta.lody wrapper and reports no applied on error", () => {
+    const proxy = newProxy();
+    init(proxy);
+
+    const request = {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "session/prompt",
+      params: {
+        sessionId: "s1",
+        prompt: [],
+        _meta: { lody: { steer: { id: "st-e" } } },
+      },
+    };
+    const out = proxy.handleClient(request);
+    expect(out.toRuntime).toEqual([
+      {
+        ...request,
+        params: { sessionId: "s1", prompt: [] },
+      },
+    ]);
+
+    const errorResponse = {
+      jsonrpc: "2.0",
+      id: 5,
+      error: { code: -32603, message: "boom" },
+    };
+    expect(proxy.handleRuntime(errorResponse)).toEqual({
+      toClient: [errorResponse],
       toRuntime: [],
     });
   });
