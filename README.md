@@ -129,18 +129,21 @@ Devin coalesces their responses onto the first user message.
 The adapter advertises `steering` v1 (`transport: "request"`,
 `upstreamTurn: "same"`, `configPolicy: "active"`) and serves it two ways:
 
-- `_lody/session/steer` is answered `injected` immediately, then forwarded as
-  an adapter-owned `session/prompt`. Its runtime response never reaches the
-  client; it only fires `_lody/session/steer_applied` with the request's
-  `steerId`. A failed forwarded prompt emits nothing client-side.
+- `_lody/session/steer` is answered `injected` immediately and forwarded as
+  an adapter-owned `session/prompt` — Devin's steer transport, so the write
+  is the application: `steer_applied` is emitted at once with the request's
+  `steerId`, and the forwarded prompt's coalesced response (which arrives
+  only at turn end, after the turn's own response) is suppressed entirely.
 - `_meta.lody.steer: { id }` on a client `session/prompt` is stripped before
-  forwarding, the response passes through normally, and `steer_applied`
-  accompanies it.
+  forwarding, `steer_applied` is emitted on send, and the response passes
+  through normally.
 
 Steers to unknown or unadmitted sessions fail with `outcome: "failed"`.
 Verified on Devin 3000.11.3 and 3000.10.31: the steering message overrides
 the in-flight instruction inside the same turn, and backgrounded tool calls
-keep running.
+keep running. Reporting `steer_applied` earlier than the coalesced response
+is required — Devin answers the turn's original request first, and a client
+racing its turn completion would otherwise drop the application.
 
 ## Validation
 
