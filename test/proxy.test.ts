@@ -45,6 +45,7 @@ describe("DevinAcpProxy", () => {
                   subagentEvents: { version: 1 },
                   compaction: { version: 1 },
                   elicitation: { version: 1 },
+                  usage: { version: 1 },
                 },
               },
             },
@@ -243,6 +244,21 @@ describe("runtime manifest", () => {
     expect(contract.compactionCompletedStatus).toBe("completed");
     expect(contract.compactionFailedStatus).toBe("failed");
     expect(contract.compactionManualCommand).toBe("/compact");
+    expect(contract.usageInputTokensMeta).toBe("cognition.ai/inputTokens");
+    expect(contract.usageOutputTokensMeta).toBe("cognition.ai/outputTokens");
+    expect(contract.usageCachedReadTokensMeta).toBe(
+      "cognition.ai/cachedReadTokens",
+    );
+    expect(contract.usageCachedWriteTokensMeta).toBe(
+      "cognition.ai/cachedWriteTokens",
+    );
+    expect(contract.usageTotalCreditCostMeta).toBe(
+      "cognition.ai/totalCreditCost",
+    );
+    expect(contract.usageTotalAcuCostMeta).toBe("cognition.ai/totalAcuCost");
+    expect(contract.usageResponseDimensionsMeta).toBe(
+      "cognition.ai/responseDimensions",
+    );
   });
 });
 
@@ -361,6 +377,7 @@ describe("compaction lifecycle translation", () => {
                   subagentEvents: { version: 1 },
                   compaction: { version: 1 },
                   elicitation: { version: 1 },
+                  usage: { version: 1 },
                 },
               },
             },
@@ -901,5 +918,220 @@ describe("compaction lifecycle translation", () => {
       toClient: [plain],
       toRuntime: [],
     });
+  });
+});
+
+describe("usage accounting translation", () => {
+  let scope = 0;
+  beforeEach(() => {
+    scope = 0;
+  });
+  const newProxy = () => new DevinAcpProxy({ newId: () => `scope-${++scope}` });
+  const initialize = (proxy: DevinAcpProxy, negotiated = false) => {
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: 1,
+        clientCapabilities: negotiated
+          ? { _meta: { lody: { subagentEvents: { version: 1 } } } }
+          : {},
+      },
+    });
+    proxy.handleRuntime(initializeResponse);
+  };
+  const newSession = (
+    proxy: DevinAcpProxy,
+    sessionId: string,
+    configOptions: unknown[] = [],
+  ) => {
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "session/new",
+      params: { cwd: "/w", mcpServers: [] },
+    });
+    proxy.handleRuntime({
+      jsonrpc: "2.0",
+      id: 2,
+      result: { sessionId, configOptions },
+    });
+  };
+  const modelOption = (value: string) => ({
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    currentValue: value,
+    options: [],
+  });
+  const usageUpdate = (
+    sessionId: string,
+    meta: Record<string, unknown>,
+    used = 110,
+    size = 262000,
+  ) => ({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: { sessionUpdate: "usage_update", used, size, _meta: meta },
+    },
+  });
+  const counters = {
+    "cognition.ai/inputTokens": 100,
+    "cognition.ai/outputTokens": 10,
+  };
+  const lodyUsageMessages = (out: { toClient: { method?: string }[] }) =>
+    out.toClient.filter((m) => m.method === "_lody/session/usage_update");
+
+  it("emits Core accounting for admitted sessions and still forwards the raw update", () => {
+    const proxy = newProxy();
+    initialize(proxy);
+    newSession(proxy, "s1");
+    const raw = usageUpdate("s1", counters);
+    const out = proxy.handleRuntime(raw);
+    expect(out.toClient).toHaveLength(2);
+    expect(out.toClient[0]).toEqual(raw);
+    const [notification] = lodyUsageMessages(out);
+    expect(notification).toMatchObject({
+      jsonrpc: "2.0",
+      method: "_lody/session/usage_update",
+      params: {
+        sessionId: "s1",
+        usage: {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadInputTokens: 0,
+          contextWindow: 262000,
+        },
+        modelUsage: {
+          devin: {
+            inputTokens: 100,
+            outputTokens: 10,
+            cacheReadInputTokens: 0,
+          },
+        },
+        delta: {
+          modelUsage: {
+            devin: {
+              inputTokens: 100,
+              outputTokens: 10,
+            },
+          },
+        },
+        _meta: { lody: { usageScopeId: "scope-1" } },
+      },
+    });
+  });
+
+  it("accounts each request once across an untagged row and its context twin", () => {
+    const proxy = newProxy();
+    initialize(proxy);
+    newSession(proxy, "s1");
+    const untagged = usageUpdate("s1", counters);
+    const tagged = usageUpdate("s1", {
+      ...counters,
+      "cognition.ai/subagent_context": { parentAgentId: "root" },
+    });
+    expect(lodyUsageMessages(proxy.handleRuntime(untagged))).toHaveLength(1);
+    const out = proxy.handleRuntime(tagged);
+    expect(out.toClient).toEqual([tagged]);
+  });
+
+  it("keys modelUsage by the session model option and follows switches", () => {
+    const proxy = newProxy();
+    initialize(proxy);
+    newSession(proxy, "s1", [modelOption("swe-2-high")]);
+    const first = proxy.handleRuntime(usageUpdate("s1", counters));
+    expect(lodyUsageMessages(first)[0]?.params?.modelUsage).toHaveProperty(
+      "swe-2-high",
+    );
+    proxy.handleRuntime({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [modelOption("gpt-6-astra-medium")],
+        },
+      },
+    });
+    const second = proxy.handleRuntime(
+      usageUpdate("s1", {
+        "cognition.ai/inputTokens": 50,
+        "cognition.ai/outputTokens": 5,
+      }),
+    );
+    const notification = lodyUsageMessages(second)[0];
+    expect(notification?.params?.modelUsage).toMatchObject({
+      "swe-2-high": { inputTokens: 100, outputTokens: 10 },
+      "gpt-6-astra-medium": { inputTokens: 50, outputTokens: 5 },
+    });
+  });
+
+  it("accounts usage for negotiated clients and keeps a single root update", () => {
+    const proxy = newProxy();
+    initialize(proxy, true);
+    newSession(proxy, "s1");
+    const raw = usageUpdate("s1", counters);
+    const out = proxy.handleRuntime(raw);
+    expect(lodyUsageMessages(out)).toHaveLength(1);
+    const rootUpdates = out.toClient.filter(
+      (m) => m.method === "session/update",
+    );
+    expect(rootUpdates).toEqual([raw]);
+  });
+
+  it("skips child-run usage and rows without token counters", () => {
+    const proxy = newProxy();
+    initialize(proxy);
+    newSession(proxy, "s1");
+    const child = usageUpdate("s1", {
+      ...counters,
+      "cognition.ai/subagent_context": { parentAgentId: "agent-9" },
+    });
+    expect(proxy.handleRuntime(child).toClient).toEqual([child]);
+    const bare = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s1",
+        update: { sessionUpdate: "usage_update", used: 5, size: 262000 },
+      },
+    };
+    expect(proxy.handleRuntime(bare).toClient).toEqual([bare]);
+  });
+
+  it("ignores usage before admission and during a load replay window", () => {
+    const proxy = newProxy();
+    initialize(proxy);
+    const early = usageUpdate("unknown", counters);
+    expect(proxy.handleRuntime(early).toClient).toEqual([early]);
+
+    proxy.handleClient({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "session/load",
+      params: { sessionId: "s2", cwd: "/w", mcpServers: [] },
+    });
+    const replayed = usageUpdate("s2", counters);
+    expect(proxy.handleRuntime(replayed).toClient).toEqual([replayed]);
+    proxy.handleRuntime({
+      jsonrpc: "2.0",
+      id: 3,
+      result: { sessionId: "s2", configOptions: [modelOption("swe-2-high")] },
+    });
+    const live = usageUpdate("s2", {
+      "cognition.ai/inputTokens": 42,
+      "cognition.ai/outputTokens": 7,
+    });
+    const out = proxy.handleRuntime(live);
+    expect(lodyUsageMessages(out)).toHaveLength(1);
+    expect(lodyUsageMessages(out)[0]?.params?.modelUsage).toHaveProperty(
+      "swe-2-high",
+    );
   });
 });

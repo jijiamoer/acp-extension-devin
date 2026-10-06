@@ -23,6 +23,13 @@
     "compactionCompletedStatus": "completed",
     "compactionFailedStatus": "failed",
     "compactionManualCommand": "/compact",
-    "elicitationAllowOtherMeta": "cognition.ai/allowOther"
+    "elicitationAllowOtherMeta": "cognition.ai/allowOther",
+    "usageInputTokensMeta": "cognition.ai/inputTokens",
+    "usageOutputTokensMeta": "cognition.ai/outputTokens",
+    "usageCachedReadTokensMeta": "cognition.ai/cachedReadTokens",
+    "usageCachedWriteTokensMeta": "cognition.ai/cachedWriteTokens",
+    "usageTotalCreditCostMeta": "cognition.ai/totalCreditCost",
+    "usageTotalAcuCostMeta": "cognition.ai/totalAcuCost",
+    "usageResponseDimensionsMeta": "cognition.ai/responseDimensions"
   }
 }

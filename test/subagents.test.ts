@@ -171,6 +171,7 @@ describe("negotiation", () => {
       subagentEvents: { version: 1 },
       compaction: { version: 1 },
       elicitation: { version: 1 },
+      usage: { version: 1 },
     });
 
     newSession(proxy);

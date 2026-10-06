@@ -20,6 +20,13 @@ export interface PrivateWireContract {
   compactionFailedStatus: string;
   compactionManualCommand: string;
   elicitationAllowOtherMeta: string;
+  usageInputTokensMeta: string;
+  usageOutputTokensMeta: string;
+  usageCachedReadTokensMeta: string;
+  usageCachedWriteTokensMeta: string;
+  usageTotalCreditCostMeta: string;
+  usageTotalAcuCostMeta: string;
+  usageResponseDimensionsMeta: string;
 }
 
 const FIELDS: readonly (keyof PrivateWireContract)[] = [
@@ -42,6 +49,13 @@ const FIELDS: readonly (keyof PrivateWireContract)[] = [
   "compactionFailedStatus",
   "compactionManualCommand",
   "elicitationAllowOtherMeta",
+  "usageInputTokensMeta",
+  "usageOutputTokensMeta",
+  "usageCachedReadTokensMeta",
+  "usageCachedWriteTokensMeta",
+  "usageTotalCreditCostMeta",
+  "usageTotalAcuCostMeta",
+  "usageResponseDimensionsMeta",
 ];
 
 function loadPrivateWireContract(): PrivateWireContract {

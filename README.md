@@ -55,10 +55,11 @@ after bilateral negotiation. Other ACP traffic passes through.
   runtime reports it.
 - Core `subagentEvents` v1, described below.
 - Core `compaction` v1, described below.
+- Core `usage` v1, described below.
 - MCP servers supplied by the client, forwarded verbatim.
 
-Usage accounting and a dedicated Plan Mode translation are not
-implemented, and the adapter does not advertise them.
+A dedicated Plan Mode translation is not implemented, and the adapter does
+not advertise it.
 
 ## Subagent events
 
@@ -91,6 +92,33 @@ attribute. Runs do not support cancellation or output reads.
 
 `session/load` and `session/resume` replay is forwarded unchanged and creates
 no runs.
+
+## Usage accounting
+
+Devin's private `cognition.ai/*` token counters on `usage_update` notifications
+become Core `SessionUsageUpdate` on `_lody/session/usage_update`, advertised as
+`agentCapabilities._meta.lody.usage` `{ version: 1 }`. The raw update still
+passes through unchanged.
+
+Each runtime row reports one inference request. Devin's `inputTokens` includes
+cache reads, so it is split into disjoint Core buckets: `inputTokens` minus
+`cachedReadTokens` becomes `inputTokens`, the reads become
+`cacheReadInputTokens`, and `cachedWriteTokens` becomes
+`cacheCreationInputTokens`. The request `size` is the model context window and
+lands on the aggregate `usage` only.
+
+Devin emits each request twice — once untagged and once tagged
+`subagent_context` — so identical counters deduplicate by signature. Rows for
+`run_subagent` children are billed to that child's own accounting identity and
+are skipped; root-agent and sidekick rows count under the session, the latter
+under a `sidekick` model bucket. Per-model `modelUsage` tracks the ACP `model`
+config option, and every counted row produces a `delta` alongside the
+cumulative totals under a per-session `usageScopeId`. Rows replayed during
+`session/load` and `session/resume` create no accounting.
+
+Private cost fields (`totalCreditCost`, `totalAcuCost`) and
+`responseDimensions` pass through verbatim under their `cognition.ai` keys;
+the adapter never maps them into `costUSD` because the units are unverified.
 
 ## Compaction
 

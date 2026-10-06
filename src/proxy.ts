@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  LODY_EXTENSION_METHODS,
   LODY_SUBAGENT_EVENT_METHOD,
   supportsLodySubagentEvents,
 } from "acp-extension-core";
@@ -17,11 +18,13 @@ import {
   type DevinSubagentEventsOptions,
   type SubagentOut,
 } from "./subagents.js";
+import { DevinSessionUsage } from "./usage.js";
 
 const SUBAGENT_SUPPORT_META = contract.subagentSupportClientCapability;
 const SUBAGENT_EVENTS_CAPABILITY = { version: 1 } as const;
 const COMPACTION_CAPABILITY = { version: 1 } as const;
 const ELICITATION_CAPABILITY = { version: 1 } as const;
+const USAGE_CAPABILITY = { version: 1 } as const;
 const COMPACTION_ACTIVITY_META = {
   lody: { activity: { version: 1, kind: "context_compaction" } },
 } as const;
@@ -122,6 +125,7 @@ function isManualCompactionPrompt(params: unknown): boolean {
 export class DevinAcpProxy {
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private readonly sessions = new Map<string, DevinSubagentEvents>();
+  private readonly usages = new Map<string, DevinSessionUsage>();
   private readonly admitted = new Set<string>();
   /** sessions inside a session/load replay window: updates pass through. */
   private readonly replaying = new Set<string>();
@@ -266,6 +270,7 @@ export class DevinAcpProxy {
               subagentEvents: SUBAGENT_EVENTS_CAPABILITY,
               compaction: COMPACTION_CAPABILITY,
               elicitation: ELICITATION_CAPABILITY,
+              usage: USAGE_CAPABILITY,
             },
           },
         },
@@ -288,6 +293,9 @@ export class DevinAcpProxy {
     ) {
       if (isRecord(msg.result) && typeof msg.result["sessionId"] === "string") {
         this.admit(msg.result["sessionId"]);
+        this.usages
+          .get(msg.result["sessionId"])
+          ?.observeConfigOptions(msg.result["configOptions"]);
       }
     } else if (
       (pending?.method === "session/load" ||
@@ -297,6 +305,20 @@ export class DevinAcpProxy {
       this.replaying.delete(pending.sessionId);
       if (msg.result !== undefined && msg.error === undefined) {
         this.admit(pending.sessionId);
+        if (isRecord(msg.result)) {
+          this.usages
+            .get(pending.sessionId)
+            ?.observeConfigOptions(msg.result["configOptions"]);
+        }
+      }
+    } else if (
+      pending?.method === "session/set_config_option" &&
+      pending.sessionId
+    ) {
+      if (isRecord(msg.result)) {
+        this.usages
+          .get(pending.sessionId)
+          ?.observeConfigOptions(msg.result["configOptions"]);
       }
     } else if (pending?.method === "session/prompt" && pending.sessionId) {
       const session = this.sessions.get(pending.sessionId);
@@ -365,20 +387,41 @@ export class DevinAcpProxy {
       typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
     const update = params["update"];
     const session = sessionId ? this.sessions.get(sessionId) : undefined;
+    const live =
+      sessionId !== undefined &&
+      this.admitted.has(sessionId) &&
+      !this.replaying.has(sessionId);
+    const usageOut: JsonRpcMessage[] = [];
+    if (live && sessionId && isRecord(update)) {
+      const tracker = this.usages.get(sessionId);
+      if (tracker && update["sessionUpdate"] === "config_option_update") {
+        tracker.observeConfigOptions(update["configOptions"]);
+      }
+      if (tracker && update["sessionUpdate"] === "usage_update") {
+        const translated = tracker.record(update);
+        if (translated !== undefined) {
+          usageOut.push({
+            jsonrpc: "2.0",
+            method: LODY_EXTENSION_METHODS.sessionUsageUpdate,
+            params: translated as unknown as Record<string, unknown>,
+          });
+        }
+      }
+    }
     if (
       !this.negotiated ||
       !sessionId ||
       !session ||
-      !this.admitted.has(sessionId) ||
-      this.replaying.has(sessionId) ||
+      !live ||
       !isRecord(update)
     ) {
-      return { toClient: [msg], toRuntime: [] };
+      return { toClient: [msg, ...usageOut], toRuntime: [] };
     }
     const toClient: JsonRpcMessage[] = [];
     for (const o of session.handleSessionUpdate(update)) {
       toClient.push(...this.render(session, o));
     }
+    toClient.push(...usageOut);
     return { toClient, toRuntime: [] };
   }
 
@@ -535,6 +578,7 @@ export class DevinAcpProxy {
         sessionId,
         new DevinSubagentEvents(sessionId, this.subagentOpts),
       );
+      this.usages.set(sessionId, new DevinSessionUsage(sessionId, this.newId));
     }
   }
 
