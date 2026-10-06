@@ -123,8 +123,10 @@ export class DevinSessionUsage {
     }
 
     const row: ModelUsage = {
-      // Devin's inputTokens includes cache reads; Core buckets are disjoint.
-      inputTokens: Math.max(0, input - cachedRead),
+      // Devin's inputTokens includes cache reads AND cache writes (verified on
+      // gpt-6-luna: input = fresh + cachedRead + cachedWrite); Core buckets
+      // are disjoint, so subtract both. SWE-2 rows omit cachedWriteTokens.
+      inputTokens: Math.max(0, input - cachedRead - (cachedWrite ?? 0)),
       outputTokens: output,
       cacheReadInputTokens: cachedRead,
     };

@@ -101,11 +101,12 @@ become Core `SessionUsageUpdate` on `_lody/session/usage_update`, advertised as
 passes through unchanged.
 
 Each runtime row reports one inference request. Devin's `inputTokens` includes
-cache reads, so it is split into disjoint Core buckets: `inputTokens` minus
-`cachedReadTokens` becomes `inputTokens`, the reads become
-`cacheReadInputTokens`, and `cachedWriteTokens` becomes
-`cacheCreationInputTokens`. The request `size` is the model context window and
-lands on the aggregate `usage` only.
+cache reads AND cache writes (verified on gpt-6-luna:
+`inputTokens = fresh + cachedRead + cachedWrite`), so it is split into disjoint
+Core buckets: `inputTokens` minus both cache shares becomes `inputTokens`,
+reads become `cacheReadInputTokens`, and `cachedWriteTokens` becomes
+`cacheCreationInputTokens`. SWE-2 rows omit `cachedWriteTokens`. The request
+`size` is the model context window and lands on the aggregate `usage` only.
 
 Devin emits each request twice — once untagged and once tagged
 `subagent_context` — so identical counters deduplicate by signature. Rows for

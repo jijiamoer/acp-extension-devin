@@ -28,6 +28,25 @@ const modelOption = (value: string) => [
 ];
 
 describe("DevinSessionUsage", () => {
+  // Real gpt-6-luna cold request: inputTokens includes the cache-write share,
+  // so only the ~3-token fresh suffix stays in the input bucket.
+  it("subtracts cache writes from input on cache-write-only rows", () => {
+    const usage = new DevinSessionUsage("s1", newId);
+    const result = usage.record(
+      usageUpdate({
+        "cognition.ai/inputTokens": 10884,
+        "cognition.ai/outputTokens": 32,
+        "cognition.ai/cachedWriteTokens": 10881,
+      }),
+    );
+    expect(result?.usage).toMatchObject({
+      inputTokens: 3,
+      outputTokens: 32,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 10881,
+    });
+  });
+
   it("translates cognition token counters into disjoint Core buckets", () => {
     const usage = new DevinSessionUsage("s1", newId);
     const result = usage.record(
@@ -120,8 +139,9 @@ describe("DevinSessionUsage", () => {
         outputTokens: 10,
         cacheReadInputTokens: 0,
       },
+      // disjoint: 50 input − 20 cache-read − 7 cache-write
       "claude-fable-5-1-medium": {
-        inputTokens: 30,
+        inputTokens: 23,
         outputTokens: 5,
         cacheReadInputTokens: 20,
         cacheCreationInputTokens: 7,
@@ -134,7 +154,7 @@ describe("DevinSessionUsage", () => {
         cacheReadInputTokens: 0,
       },
       "claude-fable-5-1-medium": {
-        inputTokens: 30,
+        inputTokens: 23,
         outputTokens: 5,
         cacheReadInputTokens: 20,
       },
